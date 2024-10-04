@@ -14,18 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package controller configures controller options.
 package controller
 
 import (
 	"crypto/tls"
 	"time"
 
-	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 
 	"github.com/crossplane/crossplane-runtime/pkg/feature"
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
+	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
+	"github.com/crossplane/crossplane-runtime/pkg/statemetrics"
 )
 
 // DefaultOptions returns a functional set of options with conservative
@@ -47,7 +49,7 @@ type Options struct {
 
 	// The GlobalRateLimiter used by this controller manager. The rate of
 	// reconciles across all controllers will be subject to this limit.
-	GlobalRateLimiter workqueue.RateLimiter
+	GlobalRateLimiter ratelimiter.RateLimiter
 
 	// PollInterval at which each controller should speculatively poll to
 	// determine whether it has work to do.
@@ -61,6 +63,12 @@ type Options struct {
 
 	// ESSOptions for External Secret Stores.
 	ESSOptions *ESSOptions
+
+	// MetricOptions for recording metrics.
+	MetricOptions *MetricOptions
+
+	// ChangeLogOptions for recording change logs.
+	ChangeLogOptions *ChangeLogOptions
 }
 
 // ForControllerRuntime extracts options for controller-runtime.
@@ -78,4 +86,22 @@ func (o Options) ForControllerRuntime() controller.Options {
 type ESSOptions struct {
 	TLSConfig     *tls.Config
 	TLSSecretName *string
+}
+
+// MetricOptions for recording metrics.
+type MetricOptions struct {
+	// PollStateMetricInterval at which each controller should record state
+	PollStateMetricInterval time.Duration
+
+	// MetricsRecorder to use for recording metrics.
+	MRMetrics managed.MetricRecorder
+
+	// MRStateMetrics to use for recording state metrics.
+	MRStateMetrics *statemetrics.MRStateMetrics
+}
+
+// ChangeLogOptions for recording changes to managed resources into the change
+// logs.
+type ChangeLogOptions struct {
+	ChangeLogger managed.ChangeLogger
 }
