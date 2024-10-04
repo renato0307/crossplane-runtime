@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/crossplane/crossplane-runtime/apis/changelogs/proto/v1alpha1"
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
@@ -63,6 +64,7 @@ const (
 	errReconcileCreate          = "create failed"
 	errReconcileUpdate          = "update failed"
 	errReconcileDelete          = "delete failed"
+	errRecordChangeLog          = "cannot record change log entry"
 
 	errExternalResourceNotExist = "external resource does not exist"
 )
@@ -137,6 +139,11 @@ func (fn CriticalAnnotationUpdateFn) UpdateCriticalAnnotations(ctx context.Conte
 // ConnectionDetails created or updated during an operation on an external
 // resource, for example usernames, passwords, endpoints, ports, etc.
 type ConnectionDetails map[string][]byte
+
+// AdditionalDetails represent any additional details the external client wants
+// to return about an operation that has been performed. These details will be
+// included in the change logs.
+type AdditionalDetails map[string]string
 
 // A ConnectionPublisher manages the supplied ConnectionDetails for the
 // supplied Managed resource. ManagedPublishers must handle the case in which
@@ -230,6 +237,9 @@ type ExternalConnecter interface {
 }
 
 // An ExternalDisconnecter disconnects from a provider.
+//
+// Deprecated: Please use Disconnect() on the ExternalClient for disconnecting
+// from the provider.
 type ExternalDisconnecter interface {
 	// Disconnect from the provider and close the ExternalClient.
 	Disconnect(ctx context.Context) error
@@ -329,16 +339,23 @@ type ExternalClient interface {
 
 	// Delete the external resource upon deletion of its associated Managed
 	// resource. Called when the managed resource has been deleted.
-	Delete(ctx context.Context, mg resource.Managed) error
+	Delete(ctx context.Context, mg resource.Managed) (ExternalDelete, error)
+
+	// Disconnect from the provider and close the ExternalClient.
+	// Called at the end of reconcile loop. An ExternalClient not requiring
+	// to explicitly disconnect to cleanup it resources, can provide a no-op
+	// implementation which just return nil.
+	Disconnect(ctx context.Context) error
 }
 
 // ExternalClientFns are a series of functions that satisfy the ExternalClient
 // interface.
 type ExternalClientFns struct {
-	ObserveFn func(ctx context.Context, mg resource.Managed) (ExternalObservation, error)
-	CreateFn  func(ctx context.Context, mg resource.Managed) (ExternalCreation, error)
-	UpdateFn  func(ctx context.Context, mg resource.Managed) (ExternalUpdate, error)
-	DeleteFn  func(ctx context.Context, mg resource.Managed) error
+	ObserveFn    func(ctx context.Context, mg resource.Managed) (ExternalObservation, error)
+	CreateFn     func(ctx context.Context, mg resource.Managed) (ExternalCreation, error)
+	UpdateFn     func(ctx context.Context, mg resource.Managed) (ExternalUpdate, error)
+	DeleteFn     func(ctx context.Context, mg resource.Managed) (ExternalDelete, error)
+	DisconnectFn func(ctx context.Context) error
 }
 
 // Observe the external resource the supplied Managed resource represents, if
@@ -361,8 +378,13 @@ func (e ExternalClientFns) Update(ctx context.Context, mg resource.Managed) (Ext
 
 // Delete the external resource upon deletion of its associated Managed
 // resource.
-func (e ExternalClientFns) Delete(ctx context.Context, mg resource.Managed) error {
+func (e ExternalClientFns) Delete(ctx context.Context, mg resource.Managed) (ExternalDelete, error) {
 	return e.DeleteFn(ctx, mg)
+}
+
+// Disconnect the external client.
+func (e ExternalClientFns) Disconnect(ctx context.Context) error {
+	return e.DisconnectFn(ctx)
 }
 
 // A NopConnecter does nothing.
@@ -392,7 +414,12 @@ func (c *NopClient) Update(_ context.Context, _ resource.Managed) (ExternalUpdat
 }
 
 // Delete does nothing. It never returns an error.
-func (c *NopClient) Delete(_ context.Context, _ resource.Managed) error { return nil }
+func (c *NopClient) Delete(_ context.Context, _ resource.Managed) (ExternalDelete, error) {
+	return ExternalDelete{}, nil
+}
+
+// Disconnect does nothing. It never returns an error.
+func (c *NopClient) Disconnect(_ context.Context) error { return nil }
 
 // An ExternalObservation is the result of an observation of an external
 // resource.
@@ -448,6 +475,10 @@ type ExternalCreation struct {
 	// unless an existing key is overwritten. Crossplane may publish these
 	// credentials to a store (e.g. a Secret).
 	ConnectionDetails ConnectionDetails
+
+	// AdditionalDetails represent any additional details the external client
+	// wants to return about the creation operation that was performed.
+	AdditionalDetails AdditionalDetails
 }
 
 // An ExternalUpdate is the result of an update to an external resource.
@@ -458,6 +489,17 @@ type ExternalUpdate struct {
 	// unless an existing key is overwritten. Crossplane may publish these
 	// credentials to a store (e.g. a Secret).
 	ConnectionDetails ConnectionDetails
+
+	// AdditionalDetails represent any additional details the external client
+	// wants to return about the update operation that was performed.
+	AdditionalDetails AdditionalDetails
+}
+
+// An ExternalDelete is the result of a deletion of an external resource.
+type ExternalDelete struct {
+	// AdditionalDetails represent any additional details the external client
+	// wants to return about the delete operation that was performed.
+	AdditionalDetails AdditionalDetails
 }
 
 // A Reconciler reconciles managed resources by creating and managing the
@@ -485,8 +527,10 @@ type Reconciler struct {
 
 	supportedManagementPolicies []sets.Set[xpv1.ManagementAction]
 
-	log    logging.Logger
-	record event.Recorder
+	log            logging.Logger
+	record         event.Recorder
+	metricRecorder MetricRecorder
+	change         ChangeLogger
 }
 
 type mrManaged struct {
@@ -544,6 +588,13 @@ func WithPollInterval(after time.Duration) ReconcilerOption {
 	}
 }
 
+// WithMetricRecorder configures the Reconciler to use the supplied MetricRecorder.
+func WithMetricRecorder(recorder MetricRecorder) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.metricRecorder = recorder
+	}
+}
+
 // PollIntervalHook represents the function type passed to the
 // WithPollIntervalHook option to support dynamic computation of the poll
 // interval.
@@ -595,6 +646,8 @@ func WithExternalConnecter(c ExternalConnecter) ReconcilerOption {
 
 // WithExternalConnectDisconnecter specifies how the Reconciler should connect and disconnect to the API
 // used to sync and delete external resources.
+//
+// Deprecated: Please use Disconnect() on the ExternalClient for disconnecting from the provider.
 func WithExternalConnectDisconnecter(c ExternalConnectDisconnecter) ReconcilerOption {
 	return func(r *Reconciler) {
 		r.external.ExternalConnectDisconnecter = c
@@ -672,6 +725,14 @@ func WithReconcilerSupportedManagementPolicies(supported []sets.Set[xpv1.Managem
 	}
 }
 
+// WithChangeLogger enables support for capturing change logs during
+// reconciliation.
+func WithChangeLogger(c ChangeLogger) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.change = c
+	}
+}
+
 // NewReconciler returns a Reconciler that reconciles managed resources of the
 // supplied ManagedKind with resources in an external system such as a cloud
 // provider API. It panics if asked to reconcile a managed resource kind that is
@@ -701,6 +762,8 @@ func NewReconciler(m manager.Manager, of resource.ManagedKind, o ...ReconcilerOp
 		supportedManagementPolicies: defaultSupportedManagementPolicies(),
 		log:                         logging.NewNopLogger(),
 		record:                      event.NewNopRecorder(),
+		metricRecorder:              NewNopMetricRecorder(),
+		change:                      newNopChangeLogger(),
 	}
 
 	for _, ro := range o {
@@ -733,6 +796,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		log.Debug("Cannot get managed resource", "error", err)
 		return reconcile.Result{}, errors.Wrap(resource.IgnoreNotFound(err), errGetManaged)
 	}
+
+	r.metricRecorder.recordFirstTimeReconciled(managed)
 
 	record := r.record.WithAnnotations("external-name", meta.GetExternalName(managed))
 	log = log.WithValues(
@@ -823,6 +888,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		// details and removed our finalizer. If we assume we were the only
 		// controller that added a finalizer to this resource then it should no
 		// longer exist and thus there is no point trying to update its status.
+		r.metricRecorder.recordDeleted(managed)
 		log.Debug("Successfully deleted managed resource")
 		return reconcile.Result{Requeue: false}, nil
 	}
@@ -897,6 +963,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 			log.Debug("Cannot disconnect from provider", "error", err)
 			record.Event(managed, event.Warning(reasonCannotDisconnect, err))
 		}
+
+		if err := external.Disconnect(ctx); err != nil {
+			log.Debug("Cannot disconnect from provider", "error", err)
+			record.Event(managed, event.Warning(reasonCannotDisconnect, err))
+		}
 	}()
 
 	observation, err := external.Observe(externalCtx, managed)
@@ -935,11 +1006,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		return reconcile.Result{Requeue: true}, nil
 	}
 
+	// deep copy the managed resource now that we've called Observe() and have
+	// not performed any external operations - we can use this as the
+	// pre-operation managed resource state in the change logs later
+	//nolint:forcetypeassert // managed.DeepCopyObject() will always be a resource.Managed.
+	managedPreOp := managed.DeepCopyObject().(resource.Managed)
+
 	if meta.WasDeleted(managed) {
 		log = log.WithValues("deletion-timestamp", managed.GetDeletionTimestamp())
 
 		if observation.ResourceExists && policy.ShouldDelete() {
-			if err := external.Delete(externalCtx, managed); err != nil {
+			deletion, err := external.Delete(externalCtx, managed)
+			if err != nil {
 				// We'll hit this condition if we can't delete our external
 				// resource, for example if our provider credentials don't have
 				// access to delete it. If this is the first time we encounter
@@ -947,6 +1025,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 				// status with the new error condition. If not, we want requeue
 				// explicitly, which will trigger backoff.
 				log.Debug("Cannot delete external resource", "error", err)
+				if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_DELETE, err, deletion.AdditionalDetails); err != nil {
+					log.Info(errRecordChangeLog, "error", err)
+				}
 				record.Event(managed, event.Warning(reasonCannotDelete, err))
 				managed.SetConditions(xpv1.Deleting(), xpv1.ReconcileError(errors.Wrap(err, errReconcileDelete)))
 				return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
@@ -960,6 +1041,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 			// unpublish and finalize. If it still exists we'll re-enter this
 			// block and try again.
 			log.Debug("Successfully requested deletion of external resource")
+			if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_DELETE, nil, deletion.AdditionalDetails); err != nil {
+				log.Info(errRecordChangeLog, "error", err)
+			}
 			record.Event(managed, event.Normal(reasonDeleted, "Successfully requested deletion of external resource"))
 			managed.SetConditions(xpv1.Deleting(), xpv1.ReconcileSuccess())
 			return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
@@ -994,6 +1078,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		// removed our finalizer. If we assume we were the only controller that
 		// added a finalizer to this resource then it should no longer exist and
 		// thus there is no point trying to update its status.
+		r.metricRecorder.recordDeleted(managed)
 		log.Debug("Successfully deleted managed resource")
 		return reconcile.Result{Requeue: false}, nil
 	}
@@ -1072,6 +1157,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 				// create failed.
 			}
 
+			if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_CREATE, err, creation.AdditionalDetails); err != nil {
+				log.Info(errRecordChangeLog, "error", err)
+			}
 			managed.SetConditions(xpv1.Creating(), xpv1.ReconcileError(errors.Wrap(err, errReconcileCreate)))
 			return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 		}
@@ -1079,6 +1167,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		// In some cases our external-name may be set by Create above.
 		log = log.WithValues("external-name", meta.GetExternalName(managed))
 		record = r.record.WithAnnotations("external-name", meta.GetExternalName(managed))
+
+		if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_CREATE, nil, creation.AdditionalDetails); err != nil {
+			log.Info(errRecordChangeLog, "error", err)
+		}
 
 		// We handle annotations specially here because it's critical
 		// that they are persisted to the API server. If we don't remove
@@ -1150,6 +1242,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		reconcileAfter := r.pollIntervalHook(managed, r.pollInterval)
 		log.Debug("External resource is up to date", "requeue-after", time.Now().Add(reconcileAfter))
 		managed.SetConditions(xpv1.ReconcileSuccess())
+		r.metricRecorder.recordFirstTimeReady(managed)
+
+		// record that we intentionally did not update the managed resource
+		// because no drift was detected. We call this so late in the reconcile
+		// because all the cases above could contribute (for different reasons)
+		// that the external object would not have been updated.
+		r.metricRecorder.recordUnchanged(managed.GetName())
+
 		return reconcile.Result{RequeueAfter: reconcileAfter}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
 	}
 
@@ -1173,9 +1273,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		// requeued implicitly when we update our status with the new error
 		// condition. If not, we requeue explicitly, which will trigger backoff.
 		log.Debug("Cannot update external resource")
+		if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_UPDATE, err, update.AdditionalDetails); err != nil {
+			log.Info(errRecordChangeLog, "error", err)
+		}
 		record.Event(managed, event.Warning(reasonCannotUpdate, err))
 		managed.SetConditions(xpv1.ReconcileError(errors.Wrap(err, errReconcileUpdate)))
 		return reconcile.Result{Requeue: true}, errors.Wrap(r.client.Status().Update(ctx, managed), errUpdateManagedStatus)
+	}
+
+	// record the drift after the successful update.
+	r.metricRecorder.recordDrift(managed)
+	if err := r.change.Log(ctx, managedPreOp, v1alpha1.OperationType_OPERATION_TYPE_UPDATE, nil, update.AdditionalDetails); err != nil {
+		log.Info(errRecordChangeLog, "error", err)
 	}
 
 	if _, err := r.managed.PublishConnection(ctx, managed, update.ConnectionDetails); err != nil {
